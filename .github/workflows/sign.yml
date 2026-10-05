@@ -1,0 +1,96 @@
+name: Sign Mobile Packages (APK & IPA)
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: 'رابط مباشر لملف التطبيق (APK أو IPA) أو اتركه فارغاً إذا رفعته للمستودع'
+        required: false
+        type: string
+      package_type:
+        description: 'نوع الحزمة'
+        required: true
+        type: choice
+        options:
+          - android
+          - ios
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # 1. تنزيل الأدوات اللازمة (Java + Android Build Tools + zsign للآيفون)
+      - name: Install Signing Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zipalign apksigner build-essential cmake openssl libssl-dev libzip-dev
+          
+          # تثبيت zsign المخصص لتوقيع الآيفون
+          git clone https://github.com/zhlynn/zsign.git /tmp/zsign
+          cd /tmp/zsign && cmake . && make && sudo make install
+
+      # 2. جلب ملف التطبيق المراد توقيعه
+      - name: Fetch Package
+        run: |
+          mkdir -p input output
+          if [ -n "${{ inputs.file_url }}" ]; then
+            echo "جاري تنزيل الملف من الرابط..."
+            curl -L -o input/app_to_sign "${{ inputs.file_url }}"
+          else
+            echo "البحث عن الملف المرفوع داخل مجلد input..."
+            # يمكنك رفع ملفك مباشرة لمجلد input في المستودع
+          fi
+
+      # 3. توقيع الأندرويد (توليد Keystore رسمي والتوقيع بـ v1 و v2 و v3)
+      - name: Sign Android APK
+        if: ${{ inputs.package_type == 'android' }}
+        run: |
+          echo "=== جاري توقيع تطبيق أندرويد ==="
+          
+          # توليد مفتاح أندرويد دائم وقوي تلقائياً
+          keytool -genkey -v -keystore release.keystore -alias appKey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass "123456" -keypass "123456" \
+            -dname "CN=LovableSigner, OU=Dev, O=App, L=Tripoli, C=LY"
+
+          # محاذاة الملف (zipalign) لضمان سرعة تشغيله على الهاتف
+          zipalign -v -p 4 input/*.apk output/aligned.apk || zipalign -v -p 4 input/app_to_sign output/aligned.apk
+
+          # التوقيع الرسمي الشامل (v1 + v2 + v3) المقبول على أندرويد 11 و 12 و 13 و 14 و 15
+          apksigner sign --ks release.keystore \
+            --ks-pass pass:123456 \
+            --key-pass pass:123456 \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out output/signed-app.apk \
+            output/aligned.apk
+
+          # التحقق من صحة التوقيع
+          apksigner verify --verbose output/signed-app.apk
+
+      # 4. توقيع الآيفون (عبر zsign إذا كانت الشهادة متوفرة)
+      - name: Sign iOS IPA
+        if: ${{ inputs.package_type == 'ios' }}
+        run: |
+          echo "=== جاري معالجة تطبيق الآيفون ==="
+          # إذا وضعت ملف الشهادة .p12 وملف .mobileprovision في مجلد certs بالمستودع
+          if [ -f "certs/cert.p12" ] && [ -f "certs/profile.mobileprovision" ]; then
+            zsign -k certs/cert.p12 -m certs/profile.mobileprovision -p "${{ secrets.P12_PASSWORD }}" -o output/signed-app.ipa input/*.ipa || \
+            zsign -k certs/cert.p12 -m certs/profile.mobileprovision -p "${{ secrets.P12_PASSWORD }}" -o output/signed-app.ipa input/app_to_sign
+          else
+            echo "ملاحظة: لتوقيع الآيفون، ضع ملف cert.p12 و profile.mobileprovision داخل مجلد certs"
+            exit 1
+          fi
+
+      # 5. رفع الملف الموقّع لتنزيله مباشرة
+      - name: Upload Signed Application
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-package
+          path: output/signed-app.*
+          retention-days: 7
